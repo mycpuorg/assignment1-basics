@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import os
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
@@ -561,6 +562,112 @@ def get_tokenizer(
     """
     raise NotImplementedError
 
+from itertools import takewhile
+from functools import reduce
+
+def initialize_vocab(
+    special_tokens: list[str] | None = None,
+) -> dict[int, bytes]:
+    """
+    Initialize BPE vocabulary and prepare for merges and training.
+    
+    Args:
+        special_tokens: A list of special token strings to be added to the vocabulary.
+    Returns:
+        A dictionary mapping integer token IDs to bytestring tokens.
+            - merges: A list of tuples, each tuple containing two bytestrings
+    """
+    # Initialize the vocabulary with all possible byte values (0-255) as individual tokens.
+    vocab = {i: bytes([i]) for i in range(256)}
+    # Add special tokens
+    for i, token in enumerate(special_tokens or []):
+        vocab[256 + i] = token.encode("utf-8")
+
+    return vocab
+
+from functools import reduce
+from itertools import takewhile
+
+def apply_merge_functional(token_tuple: tuple[bytes, ...], pair: tuple[bytes, bytes]) -> tuple[bytes, ...]:
+    """Replace all occurrences of pair in token_tuple using functional approach."""
+    
+    def process(acc_and_i, _):
+        """Accumulator: (merged_list, index)"""
+        merged, i = acc_and_i
+        
+        if i >= len(token_tuple):
+            return (merged, i)
+        
+        if i < len(token_tuple) - 1 and token_tuple[i:i+2] == pair:
+            return (merged + [pair[0] + pair[1]], i + 2)
+        else:
+            return (merged + [token_tuple[i]], i + 1)
+    
+    merged, _ = reduce(
+        process,
+        iter(range(len(token_tuple))),  # Dummy iterable
+        ([], 0)  # Initial accumulator: (merged, index)
+    )
+    
+    return tuple(merged)
+
+
+def apply_merge(token_tuple: tuple[bytes, ...], pair: tuple[bytes, bytes]) -> tuple[bytes, ...]:
+    """Replace all occurrences of pair in token_tuple."""
+    if len(token_tuple) < 2:
+        return token_tuple
+    
+    new_tokens = []
+    i = 0
+    while i < len(token_tuple):
+        if i < len(token_tuple) - 1 and token_tuple[i] == pair[0] and token_tuple[i+1] == pair[1]:
+            new_tokens.append(pair[0] + pair[1])
+            i += 2
+        else:
+            new_tokens.append(token_tuple[i])
+            i += 1
+    
+    return tuple(new_tokens)
+
+
+from itertools import takewhile
+from functools import reduce
+import regex as re
+
+def create_pre_tokenizer(input_path: str | os.PathLike, pattern: str, special_tokens: list[str]):
+    """
+    Create a closure that pre-tokenizes an input file.
+    
+    Args:
+        input_path: Path to the input file
+        pattern: Regex pattern for tokenization
+    
+    Returns:
+        A function that returns pre_token_counts when called
+    """
+    def split_on_special_tokens(text: str, special_tokens: list[str]) -> list[str]:
+        """Split text on special tokens, returning chunks between them."""
+        if not special_tokens:
+            return [text]
+        
+        # Build pattern: escape special chars, join with |
+        pattern = "|".join(re.escape(tok) for tok in special_tokens)
+        
+        # Split and filter empty strings
+        return [chunk for chunk in re.split(pattern, text) if chunk]
+
+    def pre_tokenize() -> dict[tuple[bytes, ...], int]:
+        pre_token_counts = defaultdict(int)
+        with open(input_path, 'r') as f:
+            text = f.read()  # Read entire file
+            for chunk in split_on_special_tokens(text, special_tokens):
+                for match in re.finditer(pattern, chunk):
+                    token_bytes = tuple(bytes([b]) for b in match.group(0).encode("utf-8"))
+                    pre_token_counts[token_bytes] += 1
+        return pre_token_counts
+    
+    return pre_tokenize
+
 
 def run_train_bpe(
     input_path: str | os.PathLike,
@@ -568,25 +675,44 @@ def run_train_bpe(
     special_tokens: list[str],
     **kwargs,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """Given the path to an input corpus, run train a BPE tokenizer and
-    output its vocabulary and merges.
+    # BPE training using functional programming constructs.
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
-    Args:
-        input_path (str | os.PathLike): Path to BPE tokenizer training data.
-        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
-        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
-            These strings will never be split into multiple tokens, and will always be
-            kept as a single token. If these special tokens occur in the `input_path`,
-            they are treated as any other string.
+    # Create pre-tokenizer closure and get token counts
+    pre_tokenizer = create_pre_tokenizer(input_path, PAT, special_tokens=special_tokens)
+    pre_token_counts = pre_tokenizer()
 
-    Returns:
-        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-            vocab:
-                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-                to bytes (token bytes)
-            merges:
-                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-                representing that <token1> was merged with <token2>.
-                Merges are ordered by order of creation.
-    """
-    raise NotImplementedError
+    vocab = initialize_vocab(special_tokens=special_tokens)
+
+    num_merges = vocab_size - len(vocab)
+
+    merges = []
+
+    for _ in range(num_merges):
+        # Count pairs
+        pair_counts = defaultdict(int)
+        for token_tuple, count in pre_token_counts.items():
+            for i in range(len(token_tuple) - 1):
+                pair = (token_tuple[i], token_tuple[i+1])
+                pair_counts[pair] += count
+        
+        if not pair_counts:
+            break
+        
+        # Find best pair
+        best_pair = max(pair_counts.items(), key=lambda x: (x[1], x[0]))[0]
+        
+        # Update vocab
+        vocab[len(vocab)] = best_pair[0] + best_pair[1]
+        
+        # Record merge
+        merges.append(best_pair)
+        
+        # Update pre_token_counts
+        pre_token_counts = {
+            # apply_merge_functional(token_tuple, best_pair): count
+            apply_merge(token_tuple, best_pair): count
+            for token_tuple, count in pre_token_counts.items()
+        }
+
+    return vocab, merges
