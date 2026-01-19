@@ -539,6 +539,157 @@ def run_load_checkpoint(
     """
     raise NotImplementedError
 
+class Tokenizer:
+    """
+    Deliverable: Implement a Tokenizer class that, given a vocabulary and a list of merges, encodes
+    text into integer IDs and decodes integer IDs into text. Your tokenizer should also support user-provided
+    special tokens (appending them to the vocabulary if they aren’t already there). We recommend the
+    following interface:
+
+
+
+    def decode(self, ids: list[int]) -> str Decode a sequence of token IDs into text.
+    To test your Tokenizer against our provided tests, you will first need to implement the test adapter
+    at [adapters.get_tokenizer]. Then, run uv run pytest tests/test_tokenizer.py. Your implementation should be able to pass all tests.
+    """
+
+    def __init__(self, vocab, merges, special_tokens=None):
+        #     Construct a tokenizer from a given
+        # vocabulary, list of merges, and (optionally) a list of special tokens. This function should accept
+        # the following parameters:
+        # vocab: dict[int, bytes]
+        # merges: list[tuple[bytes, bytes]]
+        # special_tokens: list[str] | None = None
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens or []
+        self.token_to_id = {v: k for k, v in vocab.items()}
+
+    
+    @classmethod
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
+        # Class method that constructs and return a Tokenizer from a serialized vocabulary and list of merges
+        # (in the same format that your BPE training code output) and (optionally) a list of special
+        # tokens. This method should accept the following additional parameters:
+        # vocab_filepath: str
+        # merges_filepath: str
+        # special_tokens: list[str] | None = None
+        vocab = {}
+        merges = []
+        with open(vocab_filepath, 'r') as vf:
+            for line in vf:
+                token_id_str, token_bytes_str = line.strip().split('\t')
+                token_id = int(token_id_str)
+                token_bytes = bytes.fromhex(token_bytes_str)
+                vocab[token_id] = token_bytes
+        with open(merges_filepath, 'r') as mf:
+            for line in mf:
+                token1_str, token2_str = line.strip().split('\t')
+                token1 = bytes.fromhex(token1_str)
+                token2 = bytes.fromhex(token2_str)
+                merges.append((token1, token2))
+        return cls(vocab, merges, special_tokens)
+
+    def encode(self, text: str) -> list[int]:
+        # Encode an input text into a sequence of token IDs.
+        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+        def split_with_special_tokens(text: str, special_tokens: list[str]) -> list[tuple[str, bool]]:
+            """Split text on special tokens, returning (chunk, is_special) tuples.
+
+            Preserves special tokens in the output with is_special=True.
+            """
+            if not special_tokens:
+                return [(text, False)] if text else []
+
+            # Sort special tokens by length (longest first) to handle overlapping tokens
+            sorted_tokens = sorted(special_tokens, key=len, reverse=True)
+
+            # Build pattern with capturing group to keep the special tokens
+            pattern = "(" + "|".join(re.escape(tok) for tok in sorted_tokens) + ")"
+
+            result = []
+            parts = re.split(pattern, text)
+            special_set = set(special_tokens)
+
+            for part in parts:
+                if part:  # Skip empty strings
+                    if part in special_set:
+                        result.append((part, True))
+                    else:
+                        result.append((part, False))
+
+            return result
+
+        def encode_chunk(chunk_text: str) -> list[int]:
+            """Encode a single chunk (not a special token) into token IDs."""
+            chunk_token_ids = []
+
+            for match in re.finditer(PAT, chunk_text):
+                # Start with individual bytes for each pre-token
+                pre_token_bytes = match.group(0).encode("utf-8")
+
+                # Each byte becomes its own token initially
+                # Need to look up each byte in token_to_id to get its token ID
+                token_ids_for_pretoken = []
+                for byte_val in pre_token_bytes:
+                    byte_as_bytes = bytes([byte_val])
+                    token_id = self.token_to_id.get(byte_as_bytes)
+                    if token_id is not None:
+                        token_ids_for_pretoken.append(token_id)
+
+                # Apply merges in order to combine bytes
+                for merge in self.merges:
+                    i = 0
+                    while i < len(token_ids_for_pretoken) - 1:
+                        # Get the bytes for current pair
+                        first_bytes = self.vocab[token_ids_for_pretoken[i]]
+                        second_bytes = self.vocab[token_ids_for_pretoken[i + 1]]
+
+                        if (first_bytes, second_bytes) == merge:
+                            merged_bytes = first_bytes + second_bytes
+                            merged_token_id = self.token_to_id.get(merged_bytes)
+                            if merged_token_id is not None:
+                                token_ids_for_pretoken[i] = merged_token_id
+                                del token_ids_for_pretoken[i + 1]
+                                continue  # Stay at same index to check for more merges
+                        i += 1
+
+                chunk_token_ids.extend(token_ids_for_pretoken)
+
+            return chunk_token_ids
+
+        # Main encoding logic
+        token_ids = []
+
+        for chunk, is_special in split_with_special_tokens(text, self.special_tokens):
+            if is_special:
+                # Special token - look up directly
+                special_token_bytes = chunk.encode("utf-8")
+                special_token_id = self.token_to_id.get(special_token_bytes)
+                if special_token_id is not None:
+                    token_ids.append(special_token_id)
+            else:
+                # Regular text - encode with BPE
+                token_ids.extend(encode_chunk(chunk))
+
+        return token_ids
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        # Given an iterable of strings (e.g., a Python file handle), return a generator
+        # that lazily yields token IDs. This is required for memory-efficient tokenization
+        # of large files that we cannot directly load into memory.
+        for line in iterable:
+            token_ids = self.encode(line)
+            for token_id in token_ids:
+                yield token_id
+
+    def decode(self, ids: list[int]) -> str:
+        # Decode a sequence of token IDs into text.
+        tokens = [self.vocab[token_id] for token_id in ids]
+        text = b''.join(tokens).decode('utf-8', errors='ignore')
+        return text
+        # raise NotImplementedError
 
 def get_tokenizer(
     vocab: dict[int, bytes],
@@ -560,7 +711,8 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return Tokenizer(vocab, merges, special_tokens=special_tokens)
+    # raise NotImplementedError
 
 from itertools import takewhile
 from functools import reduce
